@@ -1,0 +1,5 @@
+{
+  "status": "error",
+  "message": "The atc claim is not properly formatted or has invalid content",
+  "errorCode": "701"
+}
