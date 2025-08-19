@@ -5,6 +5,7 @@
 import base64, binascii, hashlib, json, os, sys
 import requests
 from dotenv import load_dotenv
+from pathlib import Path
 
 # cryptography for EC key + SPKI DER
 from cryptography.hazmat.primitives import serialization
@@ -56,13 +57,14 @@ def b64_no_newlines(b: bytes) -> str:
 
 load_dotenv()
 BASE_URL   = os.getenv("BASE_URL", "https://authenticate-api.iconectiv.com").rstrip("/")
-ICON_USER  = os.getenv("ICON_USER")  # API userId
-ICON_PASS  = os.getenv("ICON_PASS")  # API password
-ACC_ID     = os.getenv("ACC_ID")     # STI-PA account id (numeric)
-SPC        = os.getenv("SPC")        # e.g. 587L or 8864 (your SPC from STI-PA)
+API_USER   = os.getenv("API_USER")   # API userId (aligned with .env)
+API_PASS   = os.getenv("API_PASS")   # API password (aligned with .env)
+SPC        = os.getenv("OCN")        # SPC from OCN env var (aligned with .env)
+ACC_ID     = SPC                     # Use OCN as account ID
+OUT_DIR    = os.getenv("OUT_DIR", "./outputs")  # Output directory
 TOKEN_PATH = os.getenv("TOKEN_PATH", f"/api/v1/account/{ACC_ID}/token")  # per STI-PA spec
 
-for name, val in [("ICON_USER", ICON_USER), ("ICON_PASS", ICON_PASS), ("ACC_ID", ACC_ID), ("SPC", SPC)]:
+for name, val in [("API_USER", API_USER), ("API_PASS", API_PASS), ("OCN", SPC)]:
     if not val:
         sys.exit(f"Missing env: {name}")
 
@@ -72,7 +74,7 @@ s = requests.Session()
 # 1) login -> accessToken (valid ~1h)  (RFC 9448 flow) 
 # -------------------------
 login_url = f"{BASE_URL}/api/v1/auth/login"
-r = s.post(login_url, json={"userId": ICON_USER, "password": ICON_PASS}, timeout=20)
+r = s.post(login_url, json={"userId": API_USER, "password": API_PASS}, timeout=20)
 r.raise_for_status()
 data = r.json()
 if data.get("status") != "success":
@@ -81,10 +83,42 @@ access_token = data["accessToken"]
 
 # -------------------------
 # 2) ACME account key + fingerprint (RFC 9448 §3; RFC 9447 tkauth-type)
-#    You can persist these; demo generates ephemeral ES256 key.
+#    Load existing key if available, otherwise generate new ES256 key.
 # -------------------------
-acct_key = ec.generate_private_key(ec.SECP256R1())  # ES256
-acct_pub = acct_key.public_key()
+out_path = Path(OUT_DIR)
+out_path.mkdir(parents=True, exist_ok=True)
+
+acme_private_path = out_path / "acme_account_private.pem"
+acme_public_path = out_path / "acme_account_public.pem"
+
+if acme_private_path.exists():
+    # Load existing ACME account key
+    print(f"[info] Loading existing ACME account key from {acme_private_path}")
+    acct_key_pem = acme_private_path.read_bytes()
+    acct_key = serialization.load_pem_private_key(acct_key_pem, password=None)
+    acct_pub = acct_key.public_key()
+    print(f"[info] Using existing ACME account key")
+else:
+    # Generate new ACME account key
+    print(f"[info] Generating new ACME account key (ES256/P-256)")
+    acct_key = ec.generate_private_key(ec.SECP256R1())  # ES256
+    acct_pub = acct_key.public_key()
+    
+    # Save the new key immediately
+    acct_key_pem = acct_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    acme_private_path.write_bytes(acct_key_pem)
+    
+    acct_pub_pem = acct_pub.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    acme_public_path.write_bytes(acct_pub_pem)
+    print(f"[info] New ACME account key saved to {acme_private_path}")
+
 fingerprint = sha256_fingerprint_of_spki(acct_pub)
 
 # -------------------------
@@ -114,8 +148,60 @@ r.raise_for_status()
 resp = r.json()
 if resp.get("status") != "success":
     sys.exit(f"SPC token error: {resp}")
-print(json.dumps({
+
+# -------------------------
+# 5) Save outputs persistently
+# -------------------------
+# Note: ACME keys are already saved in step 2 above
+
+# Save login response
+login_data = {
+    "status": data.get("status"),
+    "accessToken": data.get("accessToken"),
+    "refreshToken": data.get("refreshToken"),
+    "message": data.get("message")
+}
+(out_path / "login.json").write_text(json.dumps(login_data, indent=2))
+
+# Save fingerprint (always update in case key was reused)
+(out_path / "acme-fingerprint.txt").write_text(fingerprint)
+
+# Save TNAuthList DER and base64
+(out_path / "tnauthlist.der").write_bytes(tnauthlist_der)
+(out_path / "tnauthlist-b64.txt").write_text(tkvalue)
+
+# Save ATC structure
+atc_data = {
+    "atc": atc,
+    "spc": SPC,
+    "account_id": ACC_ID,
+    "fingerprint": fingerprint
+}
+(out_path / "atc.json").write_text(json.dumps(atc_data, indent=2))
+
+# Save SPC token response
+spc_response = {
+    "status": resp.get("status"),
     "message": resp.get("message"),
     "spcToken": resp.get("token"),
     "crl": resp.get("crl")
-}, indent=2))
+}
+(out_path / "spc-response.json").write_text(json.dumps(spc_response, indent=2))
+
+# Save bare SPC token for convenience
+spc_token = resp.get("token")
+if spc_token:
+    (out_path / "spc-token.txt").write_text(spc_token)
+    print(f"[ok] SPC token saved to {out_path / 'spc-token.txt'}")
+else:
+    print("[warn] No SPC token in response")
+
+# Print summary
+print(f"[ok] All outputs saved to {out_path}/")
+print(f"[ok] ACME account private key: {out_path / 'acme_account_private.pem'}")
+print(f"[ok] ACME account public key: {out_path / 'acme_account_public.pem'}")
+print(f"[ok] Fingerprint: {fingerprint}")
+print(f"[ok] SPC: {SPC}")
+
+# Also print JSON response for compatibility
+print(json.dumps(spc_response, indent=2))
